@@ -1,0 +1,54 @@
+-- Marketing: TRUE attribution — ad spend joined to on-site behavior via
+-- simulated UTM tracking (utm_campaign <-> campaign_clean).
+-- Shows spend alongside the funnel it actually drove: sessions, add-to-carts,
+-- purchases, and a behavioral ROAS proxy (purchases per euro spent).
+{{ config(materialized='table', schema='gold') }}
+
+with ads as (
+    select
+        country,
+        campaign_clean                      as campaign_name,
+        platform,
+        date_trunc('month', spend_date)::date as month,
+        sum(spend)                          as spend,
+        sum(impressions)                    as impressions,
+        sum(clicks)                         as clicks,
+        sum(conversions)                    as ad_platform_conversions
+    from {{ ref('stg_campaigns') }}
+    group by 1,2,3,4
+),
+
+behavior as (
+    select
+        utm_campaign                        as campaign_name,
+        date_trunc('month', event_date)::date as month,
+        count(distinct session_id)          as sessions,
+        count_if(event_type = 'add_to_cart') as add_to_carts,
+        count_if(event_type = 'purchase')    as onsite_purchases
+    from {{ ref('stg_events') }}
+    where utm_campaign is not null           -- only UTM-tagged (paid) events
+    group by 1,2
+)
+
+select
+    a.country,
+    a.campaign_name,
+    a.platform,
+    a.month,
+    a.spend,
+    a.impressions,
+    a.clicks,
+    a.ad_platform_conversions,
+    coalesce(b.sessions, 0)         as sessions,
+    coalesce(b.add_to_carts, 0)     as add_to_carts,
+    coalesce(b.onsite_purchases, 0) as onsite_purchases,
+    -- cost per on-site purchase (blended across platforms sharing the campaign+month)
+    case when coalesce(b.onsite_purchases,0) > 0
+         then round(a.spend / b.onsite_purchases, 2) else null end as cost_per_onsite_purchase,
+    -- on-site conversion rate for this campaign's traffic
+    case when coalesce(b.sessions,0) > 0
+         then round(b.onsite_purchases / b.sessions, 4) else 0 end as session_to_purchase_rate
+from ads a
+left join behavior b
+    on a.campaign_name = b.campaign_name
+   and a.month = b.month
